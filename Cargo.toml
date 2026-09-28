@@ -1,0 +1,9 @@
+[package]
+name = "rico"
+version = "9.27.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+anyhow = "1.0.104"
+arboard = "3.6.1"
