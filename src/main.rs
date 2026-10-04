@@ -1272,12 +1272,7 @@ impl Editor {
     }
 
     fn max_navigable_row(&self) -> usize {
-        let last = self.lines.len().saturating_sub(1);
-        if last > 0 && self.lines[last].is_empty() {
-            last - 1
-        } else {
-            last
-        }
+        self.lines.len().saturating_sub(1)
     }
 
     fn refresh_tab_style_if_needed(&mut self) {
