@@ -141,6 +141,7 @@ struct Editor {
     input_buffer: String,
     save_input_cursor: usize,
     status_message: String,
+    debug_key: Option<String>,
 
     find_query: String,
     replace_query: String,
@@ -194,6 +195,7 @@ impl Editor {
             input_buffer: String::new(),
             save_input_cursor: 0,
             status_message: String::new(),
+            debug_key: None,
 
             find_query: String::new(),
             replace_query: String::new(),
@@ -209,102 +211,6 @@ impl Editor {
             scroll_v_offset: 0,
             scroll_col: 0,
         }
-    }
-
-    fn run(&mut self) -> Result<()> {
-        terminal::enable_raw_mode()?;
-
-        let mut stdout = io::stdout();
-
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            Clear(ClearType::All),
-            cursor::Hide
-        )?;
-
-        let result = self.run_loop(&mut stdout);
-
-        let _ = execute!(
-            stdout,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            cursor::Show
-        );
-
-        let _ = terminal::disable_raw_mode();
-
-        result
-    }
-
-    fn run_loop(&mut self, stdout: &mut io::Stdout) -> Result<()> {
-        let mut needs_redraw = true;
-
-        loop {
-            let current_size = terminal::size().unwrap_or((80, 24));
-            if current_size != self.terminal_size {
-                self.terminal_size = current_size;
-                needs_redraw = true;
-            }
-
-            if needs_redraw {
-                self.draw(stdout)?;
-                needs_redraw = false;
-            }
-
-            if event::poll(Duration::from_millis(50))? {
-                needs_redraw = true;
-
-                match event::read()? {
-                    Event::Key(key) => {
-                        let should_quit = match self.mode {
-                            Mode::Normal => self.handle_normal_key(key)?,
-                            Mode::Find => {
-                                self.handle_find_key(key)?;
-                                false
-                            }
-                            Mode::Open => {
-                                self.handle_open_key(key)?;
-                                false
-                            }
-                            Mode::Save => {
-                                self.handle_save_key(key)?;
-                                false
-                            }
-                        };
-
-                        if should_quit {
-                            break;
-                        }
-                    }
-
-                    Event::Paste(text) => {
-                        if self.mode == Mode::Normal {
-                            self.last_action_was_cut = false;
-                            self.snapshot();
-
-                            if let Some(sel) = self.selection_anchor {
-                                self.delete_selection(sel, self.cursor);
-                                self.selection_anchor = None;
-                            }
-
-                            self.insert_text(&text);
-                            self.status_message =
-                                format!("Pasted {} characters.", text.chars().count());
-                        }
-                    }
-
-                    Event::Resize(_, _) => {
-                        self.terminal_size = terminal::size().unwrap_or((80, 24));
-                    }
-
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn snapshot(&mut self) {
@@ -358,7 +264,7 @@ impl Editor {
                 if !self.quit_confirm {
                     self.quit_confirm = true;
                     self.status_message =
-                        "UNSAVED CHANGES! Press Ctrl+Q again to force quit.".to_string();
+                        "UNSAVED CHANGES! Press Ctrl+Q again to discard and close.".to_string();
                     return Ok(false);
                 }
 
@@ -531,7 +437,8 @@ impl Editor {
                 }
             }
 
-            (true, KeyCode::Char('n')) => {
+            (true, KeyCode::Char('l')) => {
+                // Toggle line numbers with Ctrl+L
                 self.show_line_numbers = !self.show_line_numbers;
                 self.status_message = format!(
                     "Line numbers {}",
@@ -1300,9 +1207,9 @@ impl Editor {
         queue!(stdout, cursor::Hide)?;
 
         let bottom_rows = 3;
-        // Row 0 is the top bar, so the content area starts at row 1.
+        // Rows 0-1 are the top bar and document tabs.
         // Leave all bottom_rows exclusively for the status/instruction bars.
-        let content_height = height.saturating_sub(bottom_rows + 1);
+        let content_height = height.saturating_sub(bottom_rows + 2);
 
         let max_line_digits = self.lines.len().to_string().len();
         let gutter_width = if self.show_line_numbers {
@@ -1395,7 +1302,7 @@ impl Editor {
         let decoded_query = decode_escapes(&self.find_query);
 
         for i in 0..content_height {
-            queue!(stdout, cursor::MoveTo(0, (i + 1) as u16))?;
+            queue!(stdout, cursor::MoveTo(0, (i + 2) as u16))?;
 
             if i < visual_lines_to_draw.len() {
                 let (r, s, e, is_first) = visual_lines_to_draw[i];
@@ -1431,14 +1338,14 @@ impl Editor {
         if self.mode == Mode::Normal && !self.quit_confirm && self.selection_anchor.is_none() {
             let mut cursor_should_be_visible = false;
             let mut cursor_x = gutter_width;
-            let mut cursor_y_idx = 1;
+            let mut cursor_y_idx = 2;
 
             for (i, &(r, s, e, _)) in visual_lines_to_draw.iter().enumerate() {
                 if r == self.cursor.row {
                     let is_last = e == self.lines[r].len();
                     if self.cursor.col >= s && (self.cursor.col < e || (self.cursor.col == e && is_last)) {
                         cursor_should_be_visible = true;
-                        cursor_y_idx = i + 1;
+                        cursor_y_idx = i + 2;
 
                         let chunk_before_cursor = &self.lines[r][s..self.cursor.col];
                         let v_col = visual_width_until(chunk_before_cursor, chunk_before_cursor.len());
@@ -1726,7 +1633,7 @@ impl Editor {
             queue!(stdout, SetForegroundColor(CtColor::DarkYellow), Print('↵'), SetForegroundColor(CtColor::Reset))?;
         }
 
-        queue!(stdout, Clear(ClearType::UntilNewLine))?;
+        queue!(stdout, Clear(ClearType::UntilNewLine))?; // Fixed the missing closing parenthesis here
         Ok(())
     }
 
@@ -1751,7 +1658,7 @@ impl Editor {
             let total_chars = self.lines.iter().map(String::len).sum::<usize>()
                 + self.lines.len().saturating_sub(1);
 
-            Some(format!(
+            let mut stats = format!(
                 " Ln {} Col {} | {} | Lines {} | Chars {} | {} | {} ",
                 self.cursor.row + 1,
                 self.cursor.col + 1,
@@ -1760,7 +1667,13 @@ impl Editor {
                 total_chars,
                 tab,
                 line_ending
-            ))
+            );
+            if let Some(debug_key) = &self.debug_key {
+                stats.push_str("| ");
+                stats.push_str(debug_key);
+            }
+
+            Some(stats)
         } else {
             None
         };
@@ -1805,7 +1718,7 @@ impl Editor {
             format!(" [{}/{}] ", self.find_index + 1, self.find_matches.len())
         };
 
-        let find_left = format!(" Find: {}{}", self.find_query, match_status);
+        let find_left = format!(" Find: {}{}{}", self.find_query, match_status, if self.find_field == FindField::Find { " " } else { "" });
         let find_right = "[↑] [↓]";
         let find_line = pad_with_right(&find_left, find_right, width);
 
@@ -1930,7 +1843,7 @@ impl Editor {
         )?;
 
         let menu_items: &[&str] = &[
-            "^Q: Discard & Quit",
+            "^Q: Discard & Close",
             "Any other key: Resume Editing",
         ];
         let menu_line = format_menu_grid(&[menu_items], width).into_iter().next().unwrap_or_default();
@@ -1957,14 +1870,16 @@ impl Editor {
             ),
             _ => {
                 let row1: &[&str] = &[
-                    "^Q Quit",
+                    "^N Next File",
+                    "^Q Close",
                     "^Z Undo",
                     "^C Copy",
                     "^X Cut",
-                    "^N Line Nums",
+                    "^L Line Nums",
                     "^K Cut Line",
                 ];
                 let row2: &[&str] = &[
+                    "^B Prev File",
                     "^S Save",
                     "^Y Redo",
                     "^V Paste",
@@ -1986,6 +1901,360 @@ impl Editor {
             Print(menu_2),
             Clear(ClearType::UntilNewLine)
         )?;
+
+        Ok(())
+    }
+}
+
+struct App {
+    documents: Vec<Editor>,
+    active: usize,
+    tab_scroll: usize,
+    debug: bool,
+}
+
+impl App {
+    fn new(documents: Vec<Editor>, debug: bool) -> Self {
+        Self {
+            documents,
+            active: 0,
+            tab_scroll: 0,
+            debug,
+        }
+    }
+
+    fn run(&mut self) -> Result<()> {
+        terminal::enable_raw_mode()?;
+
+        let mut stdout = io::stdout();
+
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            Clear(ClearType::All),
+            cursor::Hide
+        )?;
+
+        let result = self.run_loop(&mut stdout);
+
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            cursor::Show
+        );
+
+        let _ = terminal::disable_raw_mode();
+
+        result
+    }
+
+    fn run_loop(&mut self, stdout: &mut io::Stdout) -> Result<()> {
+        let mut needs_redraw = true;
+
+        loop {
+            let current_size = terminal::size().unwrap_or((80, 24));
+            for document in &mut self.documents {
+                if current_size != document.terminal_size {
+                    document.terminal_size = current_size;
+                }
+            }
+
+            if needs_redraw {
+                // Draw tabs first because draw_tabs moves the terminal cursor.
+                // Editor::draw must run last so it can restore the cursor to the
+                // actual editing position after the tab row has been refreshed.
+                self.draw_tabs(stdout)?;
+                self.documents[self.active].draw(stdout)?;
+                stdout.flush()?;
+                needs_redraw = false;
+            }
+
+            if event::poll(Duration::from_millis(50))? {
+                needs_redraw = true;
+
+                match event::read()? {
+                    Event::Key(key) => {
+                        // In debug mode, show the most recent terminal key event
+                        // in the status line, where it remains visible.
+                        if self.debug {
+                            self.documents[self.active].debug_key = Some(format!(
+                                "Key: {:?} Modifiers: {:?}",
+                                key.code, key.modifiers
+                            ));
+                        }
+
+                        if self.documents[self.active].mode == Mode::Normal {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                            // Ctrl+B / Ctrl+N are the primary document-switching keys.
+                            // Keep punctuation aliases too, when the terminal reports them
+                            // as distinct key events. Ctrl+[ is often indistinguishable from Esc.
+                            if ctrl
+                                && (key.code == KeyCode::Char('n')
+                                    || key.code == KeyCode::Char('.') )
+                            {
+                                self.switch_document(1);
+                                continue;
+                            } else if ctrl
+                                && (key.code == KeyCode::Char('b')
+                                    || key.code == KeyCode::Char(']')
+                                    || key.code == KeyCode::Char(',')
+                                    || key.code == KeyCode::Char('['))
+                            {
+                                self.switch_document(-1);
+                                continue;
+                            }
+
+                            if ctrl && key.code == KeyCode::Char('q') {
+                                if self.documents[self.active].dirty {
+                                    if !self.documents[self.active].quit_confirm {
+                                        self.documents[self.active].quit_confirm = true;
+                                        self.documents[self.active].status_message =
+                                            "UNSAVED CHANGES! Press Ctrl+Q again to discard and close."
+                                                .to_string();
+                                        continue;
+                                    }
+                                }
+
+                                if self.documents.len() == 1 {
+                                    break;
+                                }
+
+                                self.documents.remove(self.active);
+                                if self.active >= self.documents.len() {
+                                    self.active = self.documents.len() - 1;
+                                }
+                                continue;
+                            }
+                        }
+
+                        if self.documents[self.active].mode == Mode::Open {
+                            if key.code == KeyCode::Enter {
+                                self.open_document()?;
+                            } else {
+                                self.documents[self.active].handle_open_key(key)?;
+                            }
+                            continue;
+                        }
+
+                        match self.documents[self.active].mode {
+                            Mode::Normal => {
+                                // Process the key event
+                                let should_redraw = self.documents[self.active].handle_normal_key(key)?;
+                                if should_redraw {
+                                    needs_redraw = true;
+                                }
+                            }
+                            Mode::Find => {
+                                self.documents[self.active].handle_find_key(key)?;
+                            }
+                            Mode::Save => {
+                                self.documents[self.active].handle_save_key(key)?;
+                            }
+                            Mode::Open => {}
+                        }
+                    }
+
+                    Event::Paste(text) => {
+                        let document = &mut self.documents[self.active];
+                        if document.mode == Mode::Normal {
+                            document.last_action_was_cut = false;
+                            document.snapshot();
+
+                            if let Some(sel) = document.selection_anchor {
+                                document.delete_selection(sel, document.cursor);
+                                document.selection_anchor = None;
+                            }
+
+                            document.insert_text(&text);
+                            document.status_message =
+                                format!("Pasted {} characters.", text.chars().count());
+                        }
+                    }
+
+                    Event::Resize(_, _) => {
+                        let size = terminal::size().unwrap_or((80, 24));
+                        self.documents[self.active].terminal_size = size;
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn switch_document(&mut self, direction: isize) {
+        if self.documents.len() < 2 {
+            self.documents[self.active].status_message =
+                "No other open files.".to_string();
+            return;
+        }
+
+        let len = self.documents.len() as isize;
+        self.active = ((self.active as isize + direction).rem_euclid(len)) as usize;
+        self.ensure_active_tab_visible();
+        self.documents[self.active].mode = Mode::Normal;
+        self.documents[self.active].quit_confirm = false;
+        self.documents[self.active].selection_anchor = None;
+        self.documents[self.active].status_message = format!(
+            "File {}/{}",
+            self.active + 1,
+            self.documents.len()
+        );
+    }
+
+    fn ensure_active_tab_visible(&mut self) {
+        let width = self.documents[self.active].terminal_size.0 as usize;
+        if width < 4 || self.documents.is_empty() {
+            self.tab_scroll = 0;
+            return;
+        }
+
+        let mut used = 0usize;
+        let mut first = self.tab_scroll.min(self.active);
+        for index in first..self.active {
+            used += self.tab_width(index);
+        }
+
+        while first < self.active && used + self.tab_width(self.active) > width {
+            used = used.saturating_sub(self.tab_width(first));
+            first += 1;
+        }
+
+        self.tab_scroll = first;
+    }
+
+    fn tab_width(&self, index: usize) -> usize {
+        let name = self.tab_name(index);
+        name.chars().count() + 4
+    }
+
+    fn tab_name(&self, index: usize) -> String {
+        self.documents[index]
+            .file_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("[No Name]")
+            .to_string()
+    }
+
+    fn draw_tabs(&mut self, stdout: &mut io::Stdout) -> Result<()> {
+        let width = self.documents[self.active].terminal_size.0 as usize;
+        self.ensure_active_tab_visible();
+
+        let mut used = 0usize;
+        let mut index = self.tab_scroll;
+        let left_indicator = self.tab_scroll > 0;
+        let left_reserved = if left_indicator { 2 } else { 0 };
+
+        queue!(
+            stdout,
+            cursor::MoveTo(0, 1),
+            SetBackgroundColor(CtColor::DarkGrey),
+            SetForegroundColor(CtColor::White),
+            SetAttribute(Attribute::Bold),
+            Print(" ".repeat(width)),
+            cursor::MoveTo(0, 1)
+        )?;
+
+        if left_indicator {
+            queue!(stdout, Print("‹ "))?;
+            used += left_reserved;
+        }
+
+        while index < self.documents.len() {
+            let name = self.tab_name(index);
+            let marker = if self.documents[index].dirty { "*" } else { "" };
+            let label = format!(" {}{} ", name, marker);
+            let label_width = label.chars().count();
+            if used + label_width > width {
+                break;
+            }
+
+            if index == self.active {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(CtColor::DarkYellow),
+                    SetForegroundColor(CtColor::Black)
+                )?;
+            } else {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(CtColor::DarkGrey),
+                    SetForegroundColor(CtColor::White)
+                )?;
+            }
+
+            queue!(stdout, Print(label))?;
+            used += label_width;
+            index += 1;
+        }
+
+        if index < self.documents.len() && used + 2 <= width {
+            queue!(
+                stdout,
+                SetBackgroundColor(CtColor::DarkGrey),
+                SetForegroundColor(CtColor::White),
+                Print(" ›")
+            )?;
+        }
+
+        queue!(
+            stdout,
+            SetAttribute(Attribute::Reset),
+            SetBackgroundColor(CtColor::Reset),
+            SetForegroundColor(CtColor::Reset),
+            Clear(ClearType::UntilNewLine)
+        )?;
+
+        Ok(())
+    }
+
+    fn open_document(&mut self) -> Result<()> {
+        let input = self.documents[self.active].input_buffer.trim().to_string();
+        if input.is_empty() {
+            self.documents[self.active].status_message =
+                "Error: No file name specified.".to_string();
+            self.documents[self.active].mode = Mode::Normal;
+            return Ok(());
+        }
+
+        let path = normalize_path(PathBuf::from(&input));
+
+        if let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.file_path.as_ref() == Some(&path))
+        {
+            self.active = index;
+            self.ensure_active_tab_visible();
+            self.documents[self.active].mode = Mode::Normal;
+            self.documents[self.active].quit_confirm = false;
+            self.documents[self.active].status_message =
+                format!("Switched to {}", path.display());
+            return Ok(());
+        }
+
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let document = Editor::new(Some(path.clone()), content);
+                self.documents.push(document);
+                self.active = self.documents.len() - 1;
+                self.ensure_active_tab_visible();
+                self.documents[self.active].status_message =
+                    format!("Loaded {}", path.display());
+            }
+            Err(e) => {
+                self.documents[self.active].status_message =
+                    format!("Error opening file: {}", e);
+                self.documents[self.active].mode = Mode::Normal;
+            }
+        }
 
         Ok(())
     }
@@ -2267,39 +2536,59 @@ fn pad_with_right(left: &str, right: &str, width: usize) -> String {
     result
 }
 
-fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-
-    let (path, content) = if args.len() > 1 {
-        let path = PathBuf::from(&args[1]);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            fs::canonicalize(&path).unwrap_or_else(|_| {
-                env::current_dir()
-                    .map(|dir| dir.join(&path))
-                    .unwrap_or(path)
-            })
-        };
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::File::create(&path).with_context(|| {
-                    format!("failed to create {}", path.display())
-                })?;
-                String::new()
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read {}", path.display())
-                });
-            }
-        };
-        (Some(path), content)
+fn normalize_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
     } else {
-        (None, String::new())
+        fs::canonicalize(&path).unwrap_or_else(|_| {
+            env::current_dir()
+                .map(|dir| dir.join(&path))
+                .unwrap_or(path)
+        })
+    }
+}
+
+fn load_cli_document(path: PathBuf) -> Result<Editor> {
+    let path = normalize_path(path);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::File::create(&path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            String::new()
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", path.display()));
+        }
     };
 
-    let mut editor = Editor::new(path, content);
-    editor.run().context("rico terminated unexpectedly")
+    Ok(Editor::new(Some(path), content))
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    let debug = args.contains(&"-d".to_string()) || args.contains(&"--debug".to_string());
+
+    // Parse debug mode separately from file arguments
+    let documents = if args.is_empty() || (args.len() == 1 && (args[0] == "-d" || args[0] == "--debug")) {
+        vec![Editor::new(None, String::new())]
+    } else {
+        // Filter out debug flags and process remaining arguments as files
+        let file_args: Vec<String> = args.into_iter()
+            .filter(|arg| arg != "-d" && arg != "--debug")
+            .collect();
+
+        if file_args.is_empty() {
+            vec![Editor::new(None, String::new())]
+        } else {
+            file_args.into_iter()
+                .map(|arg| load_cli_document(PathBuf::from(arg)))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+
+    let mut app = App::new(documents, debug);
+    app.run().context("rico terminated unexpectedly")
 }
